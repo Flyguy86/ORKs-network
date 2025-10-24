@@ -1,6 +1,7 @@
 import random
 from math import ceil
 from textwrap import shorten
+import json
 
 import dash
 from dash import Dash, html, dcc, Input, Output, State, callback_context
@@ -66,8 +67,7 @@ def generate_test_graph(layers=7, top_nodes=10, min_branch=3, max_branch=5, max_
         if random.random() < 0.3:
             edges.append({"data": {"source": top_ids[i], "target": top_ids[(i + 1) % len(top_ids)]}})
 
-    # assign preset positions per-layer: keep all nodes of a layer on one horizontal row,
-    # but stagger adjacent nodes vertically (alternating) to reduce overlap and make a compact layout.
+    # assign preset positions per-layer: keep tree structure (parent centroids) and compact deeper layers
     layers_map = {}
     for n in nodes:
         layer = n["data"].get("layer", 0)
@@ -84,31 +84,119 @@ def generate_test_graph(layers=7, top_nodes=10, min_branch=3, max_branch=5, max_
     desired_total_width = 1200  # target width for the widest row (pixels)
     spacing_x = max(60, desired_total_width / max_count)  # clamp minimum spacing
 
-    for layer, nlist in layers_map.items():
-        count = len(nlist)
-        cols = count if count > 0 else 1
-        # Layer 0: larger spacing and single row (no vertical stagger)
-        if layer == 0:
-            spacing_x_layer = spacing_x * top_spacing_multiplier
-            width = (cols - 1) * spacing_x_layer
-            x_offset = -width / 2
-            base_y = layer * spacing_y
-            for idx, node in enumerate(nlist):
-                col = idx
-                x = x_offset + col * spacing_x_layer
-                y_pos = base_y  # no stagger for layer 0
-                node["position"] = {"x": x, "y": y_pos}
-        else:
-            # other layers: single horizontal row but stagger up/down for compactness
-            spacing_x_layer = spacing_x
-            width = (cols - 1) * spacing_x_layer
-            x_offset = -width / 2
-            base_y = layer * spacing_y
-            for idx, node in enumerate(nlist):
-                col = idx  # single row, one column per node
-                x = x_offset + col * spacing_x_layer
-                y_pos = base_y + (stagger_amount if (idx % 2 == 0) else -stagger_amount)
-                node["position"] = {"x": x, "y": y_pos}
+    # build parent map from edges for tree-aware layout
+    parent_map = {}
+    for e in edges:
+        src = e["data"]["source"]; tgt = e["data"]["target"]
+        parent_map.setdefault(tgt, []).append(src)
+
+    # helper map for quick id->node element
+    node_map = {n["data"]["id"]: n for n in nodes}
+
+    # 1) First position layer-0 nodes evenly (they will later be adjusted by adjust_layer0_positions using descendants)
+    top_nodes = [n for n in layers_map.get(0, [])]
+    if top_nodes:
+        cols = len(top_nodes)
+        spacing_x_layer = spacing_x * top_spacing_multiplier
+        width = (cols - 1) * spacing_x_layer
+        x_offset = -width / 2
+        base_y = 0 * spacing_y
+        for idx, node in enumerate(sorted(top_nodes, key=lambda e: e["data"]["id"])):
+            x = x_offset + idx * spacing_x_layer
+            node["position"] = {"x": x, "y": base_y}
+
+    # 2) For each deeper layer, position each node under the centroid of its parents (if available).
+    #    When many siblings collapse to the same x, we no longer force extra spacing or greedy nudges.
+    for layer in sorted([l for l in layers_map.keys() if l > 0]):
+        row_nodes = layers_map.get(layer, [])
+        if not row_nodes:
+            continue
+
+        # for fallback distribution (when parent positions are missing), compute a centered band
+        count = len(row_nodes)
+        band_width = max(spacing_x * count * 0.8, spacing_x * count)
+        start_x = -band_width / 2.0
+
+        # compute initial x aiming to cluster siblings of same parent near parent's x
+        x_assigned = {}
+
+        # build parent -> children in this layer mapping (only include parents with positions)
+        parent_children = {}
+        orphan_candidates = []  # nodes without any positioned parent
+        for node in sorted(row_nodes, key=lambda e: e["data"]["id"]):
+            nid = node["data"]["id"]
+            parents = [p for p in parent_map.get(nid, []) if p in node_map and node_map[p].get("position")]
+            if not parents:
+                orphan_candidates.append(nid)
+            else:
+                # record under each positioned parent so we can cluster siblings
+                for p in parents:
+                    parent_children.setdefault(p, []).append(nid)
+                # initial x = centroid of parent positions (useful for multi-parent cases)
+                xs = [node_map[p]["position"]["x"] for p in parents]
+                x_assigned[nid] = sum(xs) / len(xs)
+
+        # For parents that have children in this row, layout their children contiguously centered on parent's x
+        for p, kids in parent_children.items():
+            kids_unique = sorted(dict.fromkeys(kids))  # stable unique list
+            parent_x = node_map[p]["position"]["x"]
+            # simple contiguous placement with small constant spacing between siblings (no aggressive widening)
+            delta = spacing_x * 0.5
+            start_group_x = parent_x - (delta * (len(kids_unique) - 1)) / 2.0
+            for i, k in enumerate(kids_unique):
+                x_assigned[k] = start_group_x + i * delta
+
+        # assign nodes without positioned parents (orphans) evenly across the band
+        if orphan_candidates:
+            for i, nid in enumerate(orphan_candidates):
+                if len(orphan_candidates) > 1:
+                    x_assigned[nid] = start_x + (i * (band_width / max(1, len(orphan_candidates) - 1)))
+                else:
+                    x_assigned[nid] = 0.0
+
+        # ensure every node has an x (fallback)
+        for idx, node in enumerate(sorted(row_nodes, key=lambda e: e["data"]["id"])):
+            nid = node["data"]["id"]
+            if nid not in x_assigned:
+                if count > 1:
+                    x_assigned[nid] = start_x + (idx * (band_width / max(1, count - 1)))
+                else:
+                    x_assigned[nid] = 0.0
+
+        # assign final positions (no extra spreading / greedy overlap enforcement)
+        ordered_nodes = sorted(row_nodes, key=lambda e: e["data"]["id"])
+        for i, node in enumerate(ordered_nodes):
+            nid = node["data"]["id"]
+            x = x_assigned.get(nid, start_x + i * (band_width / max(1, count - 1)))
+            y = layer * spacing_y
+            # keep a small alternating vertical nudge for readability, but no horizontal forcing
+            y += (stagger_amount if (i % 2 == 0) else -stagger_amount)
+            node["position"] = {"x": x, "y": y}
+
+    # --- new: bottom-up pass to center parents over their grouped children ---
+    max_layer = max((n["data"].get("layer", 0) for n in nodes), default=0)
+    # iterate from deepest non-top layer up to layer 0
+    for layer in range(max_layer - 1, -1, -1):
+        layer_nodes = layers_map.get(layer, [])
+        if not layer_nodes:
+            continue
+
+        # set parent x to centroid of direct children's x positions (if children have positions)
+        for parent_node in layer_nodes:
+            pid = parent_node["data"]["id"]
+            # direct children (from edges)
+            child_ids = [e["data"]["target"] for e in edges if e["data"]["source"] == pid]
+            # only consider positioned children
+            positioned_children = [cid for cid in child_ids if cid in node_map and node_map[cid].get("position")]
+            if positioned_children:
+                xs = [node_map[cid]["position"]["x"] for cid in positioned_children]
+                centroid_x = sum(xs) / len(xs)
+                # preserve parent's y if set, otherwise set based on layer
+                py = parent_node.get("position", {}).get("y", layer * spacing_y)
+                parent_node["position"] = {"x": centroid_x, "y": py}
+
+        # NOTE: we intentionally do NOT run a greedy non-overlap pass here.
+        # This keeps the centroid-based tree structure intact and avoids adding extra spacing.
 
     elements = nodes + edges
     max_layer = max([n["data"]["layer"] for n in nodes])
@@ -299,8 +387,10 @@ def zoom_to_visible_layer(zoom, max_layer):
 
 def adjust_layer0_positions(nodes_list, all_elements, desired_total_width=1200, top_spacing_multiplier=1.8, min_spacing=60):
     """
-    Reposition layer-0 nodes horizontally based on how many descendant nodes
-    (from nodes_list) exist under each top node. More descendants -> more space.
+    Position layer-0 nodes horizontally to align with the centroid of their visible descendants.
+    Only descendants with layer > 0 are considered for centroid computation (ignore same-layer nodes).
+    Fallback: when centroid can't be computed, distribute remaining top nodes proportionally
+    according to descendant counts. Enforce min_spacing and center the entire row around x=0.
     Modifies nodes_list in-place (updates node["position"]).
     """
     # map node id -> node element for available nodes (only node elements, not edges)
@@ -308,10 +398,23 @@ def adjust_layer0_positions(nodes_list, all_elements, desired_total_width=1200, 
 
     # build children adjacency from full graph (all_elements)
     children = {}
+    layer_map = {}
     for el in all_elements:
         d = el.get("data", {})
         if "source" in d:
             children.setdefault(d["source"], []).append(d["target"])
+        else:
+            # record layer for every node id
+            layer_map[d["id"]] = d.get("layer", 0)
+
+    # collect preset positions from all_elements (if present)
+    pos_map = {}
+    for el in all_elements:
+        d = el.get("data", {})
+        if "source" not in d:
+            p = el.get("position")
+            if isinstance(p, dict) and "x" in p and "y" in p:
+                pos_map[d["id"]] = p
 
     # find top layer nodes that exist in the current filtered node set
     top_nodes = [nid for nid, n in node_map.items() if n["data"].get("layer") == 0]
@@ -320,9 +423,9 @@ def adjust_layer0_positions(nodes_list, all_elements, desired_total_width=1200, 
 
     included_ids = set(node_map.keys())
 
-    # count visible descendants (all layers below) reachable from a top node
-    def count_descendants(root):
-        cnt = 0
+    # collect all reachable descendants (DFS)
+    def descendants(root):
+        res = set()
         stack = list(children.get(root, []))
         seen = set()
         while stack:
@@ -330,34 +433,127 @@ def adjust_layer0_positions(nodes_list, all_elements, desired_total_width=1200, 
             if cur in seen:
                 continue
             seen.add(cur)
-            if cur in included_ids:
-                cnt += 1
-            # continue traversal regardless of whether cur is included, to account deeper descendants
+            res.add(cur)
             stack.extend(children.get(cur, []))
-        return cnt
+        return res
 
-    weights = [max(1, count_descendants(tn)) for tn in top_nodes]
-    total_weight = sum(weights) or 1
+    # compute centroid x for each top node using only included descendants that have positions and are higher-layer (>0)
+    centroids = []
+    weights = []
+    for tn in top_nodes:
+        descs = descendants(tn) & included_ids
+        # consider only descendants with layer > 0 for centroid and weight
+        xs = [pos_map[d]["x"] for d in descs if d in pos_map and layer_map.get(d, 0) > 0]
+        centroid = (sum(xs) / len(xs)) if xs else None
+        centroids.append(centroid)
+        # weight used for fallback distribution: count only higher-layer descendants
+        higher_count = sum(1 for d in descs if layer_map.get(d, 0) > 0)
+        weights.append(max(1, higher_count))
 
+    # total width to allocate
     total_width = max(desired_total_width, min_spacing * len(top_nodes)) * top_spacing_multiplier
-    unit = total_width / total_weight
 
-    # compute centered x positions proportionally to weight
-    start = - (total_width / 2.0)
-    positions_x = []
-    cursor = start
-    for w in weights:
-        x_center = cursor + (w * unit) / 2.0
-        positions_x.append(x_center)
-        cursor += w * unit
+    # create initial x list: use centroid where available, mark None for others
+    xs_initial = list(centroids)
+
+    # For nodes without centroid, allocate positions using proportional weights across remaining span
+    missing_idx = [i for i, x in enumerate(xs_initial) if x is None]
+    if missing_idx:
+        # compute remaining span allocation: we will distribute along [-W/2, W/2]
+        start = -total_width / 2.0
+        # compute proportional slots by weight among missing
+        missing_weights = [weights[i] for i in missing_idx]
+        total_missing_weight = sum(missing_weights) or 1
+        cursor = start
+        for i, idx in enumerate(missing_idx):
+            w = missing_weights[i]
+            slot = (w / total_missing_weight) * total_width
+            # center of allocated slot
+            x_center = cursor + slot / 2.0
+            xs_initial[idx] = x_center
+            cursor += slot
+
+    # For any remaining nodes (shouldn't be), fallback to evenly spaced
+    for i, x in enumerate(xs_initial):
+        if x is None:
+            xs_initial[i] = (i - (len(xs_initial) - 1) / 2.0) * max(min_spacing, total_width / max(1, len(xs_initial)))
+
+    # Now enforce min_spacing between adjacent top nodes while preserving order
+    pairs = sorted([(x, i) for i, x in enumerate(xs_initial)], key=lambda t: t[0])
+    for k in range(1, len(pairs)):
+        prev_x, prev_i = pairs[k - 1]
+        cur_x, cur_i = pairs[k]
+        if cur_x < prev_x + min_spacing:
+            cur_x = prev_x + min_spacing
+            pairs[k] = (cur_x, cur_i)
+    final_xs = [0.0] * len(pairs)
+    for x, i in pairs:
+        final_xs[i] = x
+
+    # center the whole row around x=0
+    mean_x = sum(final_xs) / len(final_xs)
+    final_xs = [x - mean_x for x in final_xs]
 
     # apply positions (preserve existing y if present)
-    for tn, x in zip(top_nodes, positions_x):
+    for tn, x in zip(top_nodes, final_xs):
         el = node_map.get(tn)
         if not el:
             continue
         y = el.get("position", {}).get("y") if el.get("position") else 0
         el["position"] = {"x": x, "y": y}
+
+
+# new helper: lay out the currently visible focused nodes in a vertical tree (focus node at y=0)
+def layout_focus_vertical(nodes_list, focus_id, spacing_y=140, min_spacing_x=80):
+    """
+    Update nodes_list (in-place) node["position"] for a vertical tree layout centered on focus_id.
+    Parents (smaller layer numbers) are placed above, children below.
+    """
+    # map id -> node element (node-only elements)
+    node_map = {n["data"]["id"]: n for n in nodes_list if "source" not in n.get("data", {})}
+
+    if focus_id not in node_map:
+        # nothing to layout if focus not visible in current filtered set
+        return
+
+    focus_layer = node_map[focus_id]["data"].get("layer", 0)
+
+    # group nodes by relative layer (layer - focus_layer)
+    groups = {}
+    for nid, el in node_map.items():
+        layer = el["data"].get("layer", 0)
+        rel = layer - focus_layer
+        groups.setdefault(rel, []).append(el)
+
+    # sort relative layers so vertical order is deterministic (parents above -> negative rel, then focus rel 0, then children)
+    rel_layers = sorted(groups.keys())
+
+    # compute positions for each relative layer row
+    for rel in rel_layers:
+        row = groups[rel]
+        count = len(row)
+        # estimate label widths to avoid overlaps (approximate)
+        labels = [n["data"].get("label", "") for n in row]
+        char_w = 7  # approx pixels per character
+        padding = 20
+        widths = [max(40, len(lbl) * char_w + padding) for lbl in labels] if labels else [min_spacing_x]
+        max_width = max(widths)
+
+        # dynamic spacing: ensure spacing >= min_spacing_x and large enough to fit widest label
+        spacing_x = max(min_spacing_x, max_width + 8, 120)
+
+        # if there are many nodes, slightly increase spacing to reduce collisions
+        if count > 8:
+            spacing_x *= 1.0 + (count - 8) * 0.04
+
+        width = (count - 1) * spacing_x
+        x_start = -width / 2.0
+        y_pos = rel * spacing_y
+        # stabilize order by node id to avoid jumping
+        row_sorted = sorted(row, key=lambda e: e["data"].get("id"))
+        for i, node in enumerate(row_sorted):
+            x = x_start + i * spacing_x
+            node["position"] = {"x": x, "y": y_pos}
 
 
 # replace the filter_elements callback with focus-aware filtering
@@ -399,6 +595,10 @@ def filter_elements(zoom, show_all, manual_layer, focus_node_id, all_elements, m
                 s = data["source"]; t = data["target"]
                 children.setdefault(s, set()).add(t)
                 parents.setdefault(t, set()).add(s)
+            else:
+                if data["id"] == focus_node_id:
+                    # for the focus node, ensure it has a defined position (in case it's a new addition)
+                    children.setdefault(None, set()).add(data["id"])
 
         included = set()
         included.add(focus_node_id)
@@ -426,8 +626,8 @@ def filter_elements(zoom, show_all, manual_layer, focus_node_id, all_elements, m
                 if data["id"] in included:
                     filtered_nodes.append(el)
 
-        # adjust layer0 spacing for the focused subset (will space only top nodes present)
-        adjust_layer0_positions(filtered_nodes, all_elements, desired_total_width=800, top_spacing_multiplier=1.6)
+        # layout focused subset vertically (focus node centered at y=0)
+        layout_focus_vertical(filtered_nodes, focus_node_id, spacing_y=120, min_spacing_x=100)
 
         msg = f"Focus: {focus_node_id} — showing related nodes (total nodes: {len(filtered_nodes)})"
         return filtered_nodes + filtered_edges, msg
@@ -476,10 +676,11 @@ def adjust_viewport_for_focus(focus_node_id, all_elements):
         # don't change viewport when focus cleared
         return dash.no_update, dash.no_update
 
-    # build positions map and adjacency to compute included nodes bounding box
+    # build adjacency and preset positions map
     parents = {}
     children = {}
     pos = {}
+    node_elements = {}
     for el in all_elements:
         data = el.get("data", {})
         if "source" in data:
@@ -487,7 +688,7 @@ def adjust_viewport_for_focus(focus_node_id, all_elements):
             children.setdefault(s, set()).add(t)
             parents.setdefault(t, set()).add(s)
         else:
-            # read preset position if available
+            node_elements[data.get("id")] = el
             p = el.get("position")
             if isinstance(p, dict) and "x" in p and "y" in p:
                 pos[data["id"]] = p
@@ -502,10 +703,26 @@ def adjust_viewport_for_focus(focus_node_id, all_elements):
         included.update(children.get(c, set()))
 
     xs = []; ys = []
+    missing = []
     for node_id in included:
-        p = pos.get(node_id)
-        if p:
-            xs.append(p["x"]); ys.append(p["y"])
+        if node_id in pos:
+            xs.append(pos[node_id]["x"]); ys.append(pos[node_id]["y"])
+        else:
+            missing.append(node_id)
+
+    if missing:
+        # compute temporary vertical layout for included nodes so viewport can center/zoom correctly
+        temp_nodes = []
+        for nid in included:
+            el = node_elements.get(nid)
+            layer = el.get("data", {}).get("layer", 0) if el else 0
+            temp_nodes.append({"data": {"id": nid, "layer": layer}})
+        layout_focus_vertical(temp_nodes, focus_node_id, spacing_y=120, min_spacing_x=100)
+        for el in temp_nodes:
+            p = el.get("position")
+            if p:
+                xs.append(p["x"]); ys.append(p["y"])
+
     if not xs or not ys:
         return dash.no_update, dash.no_update
 
@@ -514,7 +731,6 @@ def adjust_viewport_for_focus(focus_node_id, all_elements):
     bbox_w = max(10, maxx - minx)
     bbox_h = max(10, maxy - miny)
 
-    # viewport size heuristics (match Cytoscape style height/width)
     view_w = 900.0
     view_h = 600.0
     zoom_x = view_w / (bbox_w + 200)
@@ -531,16 +747,28 @@ def adjust_viewport_for_focus(focus_node_id, all_elements):
 # replace node details callback to include full lineage (all ancestor paths up to top layer)
 @app.callback(
     Output("node-details", "children"),
-    Input("cyt", "tapNodeData"),
+    Input("focus-store", "data"),
     State("all-elements-store", "data"),
 )
-def show_node_details(data, all_elements):
-    if not data:
+def show_node_details(focus_node_id, all_elements):
+    if not focus_node_id:
         return "Click a node to see full details."
-    node_id = data.get("id")
-    title = data.get("label", "")
-    full = data.get("full_text", "")
-    layer = data.get("layer", "")
+
+    # find the full node element in the stored full-elements list
+    node_data = None
+    for el in all_elements:
+        d = el.get("data", {})
+        if d.get("id") == focus_node_id:
+            node_data = d
+            break
+
+    if not node_data:
+        return f"Node {focus_node_id} not found."
+
+    node_id = node_data.get("id")
+    title = node_data.get("label", "")
+    full = node_data.get("full_text", "")
+    layer = node_data.get("layer", "")
 
     # build parents map from the full element list
     parents = {}
@@ -562,20 +790,17 @@ def show_node_details(data, all_elements):
         return paths
 
     paths = ancestor_paths(node_id)
-    # format lineage: each path as "A -> B -> C"
+
+    # build a map id -> label for nodes for faster lookup
+    id_to_label = {}
+    for el in all_elements:
+        d = el.get("data", {})
+        if "source" not in d:
+            id_to_label[d.get("id")] = d.get("label", d.get("id"))
+
     formatted = []
     for p in paths:
-        # map ids to labels if possible
-        labels = []
-        for nid in p:
-            # find label in all_elements
-            lbl = nid
-            for el in all_elements:
-                d = el.get("data", {})
-                if d.get("id") == nid:
-                    lbl = d.get("label", nid)
-                    break
-            labels.append(lbl)
+        labels = [id_to_label.get(nid, nid) for nid in p]
         formatted.append(" -> ".join(labels))
 
     lineage_text = "\n".join(formatted) if formatted else node_id
@@ -645,17 +870,6 @@ def adjust_manual_layer(inc_clicks, dec_clicks, auto_clicks, manual_layer, max_l
     return new, display
 
 
-# add a callback for the Clear Focus button so it actually clears focus
-@app.callback(
-    Output("focus-store", "data"),
-    Input("clear-focus-btn", "n_clicks"),
-)
-def clear_focus(n):
-    if not n:
-        return dash.no_update
-    return None
-
-
 # Replace the two separate focus callbacks with one combined callback to avoid duplicate outputs.
 @app.callback(
     Output("focus-store", "data"),
@@ -680,6 +894,20 @@ def handle_focus(tap_node_data, clear_n):
         return tap_node_data.get("id")
 
     return dash.no_update
+
+
+# Example input structure (nodes + edges). Format this way if you want to feed/serialize the network.
+EXAMPLE_INPUT = {
+    "nodes": [
+        {"id": "L0-0", "label": "TopNode 0", "layer": 0, "full_text": "Detailed text..."},
+        {"id": "L1-0-1", "label": "Child A", "layer": 1, "full_text": "Child detailed..."},
+        {"id": "L1-0-2", "label": "Child B", "layer": 1, "full_text": "Child detailed..."}
+    ],
+    "edges": [
+        {"source": "L0-0", "target": "L1-0-1"},
+        {"source": "L0-0", "target": "L1-0-2"}
+    ]
+}
 
 
 if __name__ == "__main__":
