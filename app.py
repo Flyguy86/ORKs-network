@@ -173,21 +173,33 @@ def generate_test_graph(layers=7, top_nodes=10, min_branch=3, max_branch=5, max_
             y += (stagger_amount if (i % 2 == 0) else -stagger_amount)
             node["position"] = {"x": x, "y": y}
 
-    # --- new: bottom-up pass to center parents over their grouped children ---
+    # --- new: bottom-up pass to center parents over their grouped children (only for layers >= 1) ---
     max_layer = max((n["data"].get("layer", 0) for n in nodes), default=0)
-    # iterate from deepest non-top layer up to layer 0
-    for layer in range(max_layer - 1, -1, -1):
+    # iterate from deepest non-top layer up to layer 1 (do not re-center layer 0 here)
+    for layer in range(max_layer - 1, 0, -1):
         layer_nodes = layers_map.get(layer, [])
         if not layer_nodes:
             continue
 
-        # set parent x to centroid of direct children's x positions (if children have positions)
+        # set parent x to centroid of direct children's x positions (only consider children in deeper layers)
         for parent_node in layer_nodes:
             pid = parent_node["data"]["id"]
             # direct children (from edges)
             child_ids = [e["data"]["target"] for e in edges if e["data"]["source"] == pid]
-            # only consider positioned children
-            positioned_children = [cid for cid in child_ids if cid in node_map and node_map[cid].get("position")]
+
+            # only consider positioned children that are in a deeper layer than the parent
+            positioned_children = []
+            for cid in child_ids:
+                child = node_map.get(cid)
+                if not child:
+                    continue
+                child_layer = child["data"].get("layer", 0)
+                # require child_layer > parent_layer to avoid using siblings or same-layer nodes
+                if child_layer <= layer:
+                    continue
+                if child.get("position"):
+                    positioned_children.append(cid)
+
             if positioned_children:
                 xs = [node_map[cid]["position"]["x"] for cid in positioned_children]
                 centroid_x = sum(xs) / len(xs)
@@ -195,8 +207,8 @@ def generate_test_graph(layers=7, top_nodes=10, min_branch=3, max_branch=5, max_
                 py = parent_node.get("position", {}).get("y", layer * spacing_y)
                 parent_node["position"] = {"x": centroid_x, "y": py}
 
-        # NOTE: we intentionally do NOT run a greedy non-overlap pass here.
-        # This keeps the centroid-based tree structure intact and avoids adding extra spacing.
+    # NOTE: we intentionally do NOT run a greedy non-overlap pass here.
+    # This keeps the centroid-based tree structure intact and avoids adding extra spacing.
 
     elements = nodes + edges
     max_layer = max([n["data"]["layer"] for n in nodes])
