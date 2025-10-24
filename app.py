@@ -165,9 +165,17 @@ def generate_test_graph(layers=7, top_nodes=10, min_branch=3, max_branch=5, max_
 
         # assign final positions (no extra spreading / greedy overlap enforcement)
         ordered_nodes = sorted(row_nodes, key=lambda e: e["data"]["id"])
+
+        # prepare 4-way horizontal stagger pattern (multipliers)
+        stagger_multipliers = [-1.5, -0.5, 0.5, 1.5]
+        # small base stagger distance relative to spacing_x so offsets remain subtle
+        base_stagger = spacing_x * 0.12
+
         for i, node in enumerate(ordered_nodes):
             nid = node["data"]["id"]
             x = x_assigned.get(nid, start_x + i * (band_width / max(1, count - 1)))
+            # apply 4-way horizontal stagger pattern
+            x += stagger_multipliers[i % 4] * base_stagger
             y = layer * spacing_y
             # keep a small alternating vertical nudge for readability, but no horizontal forcing
             y += (stagger_amount if (i % 2 == 0) else -stagger_amount)
